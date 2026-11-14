@@ -1,11 +1,11 @@
 package com.ttcraft.client;
 import com.ttcraft.droidmedia.*;
-import net.minecraft.client.gui.GuiGraphics;
-import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.renderer.RenderPipelines;
-import net.minecraft.network.chat.Component;
-import net.minecraft.resources.Identifier;
+import net.minecraft.client.gl.RenderPipelines;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
 import org.lwjgl.system.MemoryUtil;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -19,18 +19,18 @@ public class TikTokScreen extends Screen {
     private long startTimeMs = -1, lastFramePtsMs = -1;
 
     public TikTokScreen(String videoPath) {
-        super(Component.literal("TikTokCraft"));
+        super(Text.literal("TikTokCraft"));
         this.videoPath = videoPath;
     }
 
     @Override
     protected void init() {
-        addRenderableWidget(Button.builder(Component.literal("След. видео ▼"), btn -> {
+        addDrawableChild(ButtonWidget.builder(Text.literal("След. видео ▼"), btn -> {
             if (playerHandle != 0) {
                 DroidMediaNative.nativeSeekToStart(playerHandle);
                 startTimeMs = System.currentTimeMillis(); lastFramePtsMs = -1;
             }
-        }).bounds(this.width - 110, this.height / 2 - 10, 100, 20).build());
+        }).dimensions(this.width - 110, this.height / 2 - 10, 100, 20).build());
         try {
             NativeLoader.ensureLoaded();
             playerHandle = DroidMediaNative.nativeCreate(videoPath);
@@ -47,11 +47,11 @@ public class TikTokScreen extends Screen {
     }
 
     @Override
-    public void render(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
-        super.render(graphics, mouseX, mouseY, delta);
+    public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+        super.render(context, mouseX, mouseY, delta);
         int phoneH = (int) (this.height * 0.85), phoneW = (int) (phoneH * 9.0 / 16.0);
         int x = (this.width - phoneW) / 2, y = (this.height - phoneH) / 2;
-        graphics.fill(x - 4, y - 4, x + phoneW + 4, y + phoneH + 4, 0xFF181818);
+        context.fill(x - 4, y - 4, x + phoneW + 4, y + phoneH + 4, 0xFF181818);
         if (playerHandle != 0 && frameBuffer != null) {
             int pcmBytes = DroidMediaNative.nativeReadAudioPcm(playerHandle, pcmBuffer);
             if (pcmBytes > 0 && audioOut != null) audioOut.queuePcm(pcmBuffer, pcmBytes);
@@ -67,9 +67,9 @@ public class TikTokScreen extends Screen {
                 }
             }
             Identifier texId = videoTexture.getTextureId();
-            if (texId != null) graphics.blit(RenderPipelines.GUI_TEXTURED, texId, x, y, 0.0f, 0.0f, phoneW, phoneH, phoneW, phoneH);
+            if (texId != null) context.drawTexture(RenderPipelines.GUI_TEXTURED, texId, x, y, 0.0f, 0.0f, phoneW, phoneH, phoneW, phoneH);
         } else {
-            graphics.drawCenteredString(this.font, Component.literal("Положи тестовое видео в .minecraft/tiktok_test.mp4"), this.width / 2, this.height / 2, 0xFFFFFFFF);
+            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal("Положи тестовое видео в .minecraft/tiktok_test.mp4"), this.width / 2, this.height / 2, 0xFFFFFFFF);
         }
     }
 
