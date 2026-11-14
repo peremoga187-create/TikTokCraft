@@ -20,11 +20,11 @@ public class TikTokScreen extends Screen {
         int cy = this.height / 2;
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Открыть TikTok (Вход / Лента)"), b ->
-                ConfirmLinkScreen.confirmLinkNow(this, "https://www.tiktok.com/")
+                ConfirmLinkScreen.open(this, "https://www.tiktok.com/")
         ).dimensions(cx - 120, cy - 24, 240, 22).build());
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Рекомендации (Explore)"), b ->
-                ConfirmLinkScreen.confirmLinkNow(this, "https://www.tiktok.com/explore")
+                ConfirmLinkScreen.open(this, "https://www.tiktok.com/explore")
         ).dimensions(cx - 120, cy + 4, 240, 20).build());
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Назад"), b -> close())
