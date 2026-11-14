@@ -3,14 +3,14 @@
   "id": "tiktokcraft",
   "version": "${version}",
   "name": "TikTokCraft",
-  "description": "TikTok player inside Minecraft with DroidMedia",
+  "description": "TikTok inside Minecraft",
   "authors": ["You"],
   "license": "MIT",
   "environment": "client",
-  "mixins": ["tiktokcraft.mixins.json"],
   "entrypoints": {
     "client": ["com.ttcraft.client.TikTokCraftClient"]
   },
+  "mixins": ["tiktokcraft.mixins.json"],
   "depends": {
     "fabricloader": ">=0.16.0",
     "minecraft": "~1.21.11",
