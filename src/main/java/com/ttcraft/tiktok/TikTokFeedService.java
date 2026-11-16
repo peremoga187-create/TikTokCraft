@@ -4,44 +4,63 @@ import com.google.gson.*;
 import net.fabricmc.loader.api.FabricLoader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import java.io.InputStream;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.net.http.*;
+
+import java.io.*;
+import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class TikTokFeedService {
     private static final Logger LOG = LoggerFactory.getLogger("TikTokCraft");
-    private static final String UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36";
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .connectTimeout(Duration.ofSeconds(10)).build();
+    private static final String UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
     private static final ExecutorService POOL = Executors.newFixedThreadPool(3, r -> {
         Thread t = new Thread(r, "TikTokCraft-Net");
         t.setDaemon(true);
         return t;
     });
-
+    private static final AtomicBoolean FETCHING = new AtomicBoolean(false);
     private static volatile List<TikTokVideo> cachedFeed = List.of();
+
     public static List<TikTokVideo> getCachedFeed() { return cachedFeed; }
 
     public static void fetchFeedAsync(String query, Consumer<List<TikTokVideo>> onOk, Consumer<String> onErr) {
+        if (!FETCHING.compareAndSet(false, true)) {
+            LOG.info("Feed fetch already in progress, skipping duplicate call");
+            return;
+        }
         POOL.submit(() -> {
             try {
                 List<TikTokVideo> list = fetchFeed(query);
-                if (list.isEmpty()) onErr.accept("Пустой ответ от TikTok API");
-                else {
+                if (!list.isEmpty()) {
                     cachedFeed = list;
+                    saveFeedToDisk(list);
                     onOk.accept(list);
+                    return;
+                }
+                List<TikTokVideo> disk = loadFeedFromDisk();
+                if (!disk.isEmpty() && (query == null || query.trim().isEmpty())) {
+                    cachedFeed = disk;
+                    onOk.accept(disk);
+                } else {
+                    onErr.accept("Пустой ответ от TikTok API");
                 }
             } catch (Exception e) {
                 LOG.error("Feed fetch error", e);
-                onErr.accept(e.getClass().getSimpleName() + ": " + e.getMessage());
+                List<TikTokVideo> disk = loadFeedFromDisk();
+                if (!disk.isEmpty() && (query == null || query.trim().isEmpty())) {
+                    cachedFeed = disk;
+                    onOk.accept(disk);
+                } else {
+                    onErr.accept(e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            } finally {
+                FETCHING.set(false);
             }
         });
     }
@@ -55,35 +74,90 @@ public final class TikTokFeedService {
         String apiUrl = isUrl
                 ? "https://www.tikwm.com/api/?url=" + enc(q)
                 : isUser
-                ? "https://www.tikwm.com/api/user/posts?unique_id=" + enc(q) + "&count=15&cursor=0"
+                ? "https://www.tikwm.com/api/user/posts?unique_id=" + enc(q) + "&count=10&cursor=0"
                 : isSearch
-                ? "https://www.tikwm.com/api/feed/search?keywords=" + enc(q) + "&count=15&cursor=0"
-                : "https://www.tikwm.com/api/feed/list?region=UA&count=15";
+                ? "https://www.tikwm.com/api/feed/search?keywords=" + enc(q) + "&count=10&cursor=0"
+                : "https://www.tikwm.com/api/feed/list?region=UA&count=10";
 
         try {
             List<TikTokVideo> out = requestAndParse(apiUrl, isUrl);
             if (!out.isEmpty()) return out;
         } catch (Exception firstErr) {
-            LOG.warn("First attempt failed ({}), retrying after 1.3s...", firstErr.getMessage());
+            LOG.warn("tikwm attempt 1 failed: {}", firstErr.getMessage());
         }
+
         Thread.sleep(1300);
-        String fallbackUrl = (!isUrl && !isUser && !isSearch)
-                ? "https://www.tikwm.com/api/feed/list?region=US&count=15" : apiUrl;
-        return requestAndParse(fallbackUrl, isUrl);
+        try {
+            String fallbackUrl = (!isUrl && !isUser && !isSearch)
+                    ? "https://www.tikwm.com/api/feed/list?region=US&count=10" : apiUrl;
+            List<TikTokVideo> out = requestAndParse(fallbackUrl, isUrl);
+            if (!out.isEmpty()) return out;
+        } catch (Exception secondErr) {
+            LOG.warn("tikwm attempt 2 failed: {}", secondErr.getMessage());
+            if (isUrl) {
+                TikTokVideo direct = fetchDirectTikTokPage(q);
+                if (direct != null) return List.of(direct);
+            }
+            throw secondErr;
+        }
+        return List.of();
     }
 
     private static String enc(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8); }
 
-    private static List<TikTokVideo> requestAndParse(String apiUrl, boolean isUrl) throws Exception {
-        LOG.info("Requesting TikTok API: {}", apiUrl);
-        HttpRequest req = HttpRequest.newBuilder(URI.create(apiUrl))
-                .timeout(Duration.ofSeconds(15))
-                .header("User-Agent", UA).header("Accept", "application/json").GET().build();
-        HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-        LOG.info("API HTTP {} (len={})", resp.statusCode(), resp.body().length());
-        if (resp.statusCode() < 200 || resp.statusCode() >= 300) throw new RuntimeException("HTTP " + resp.statusCode());
+    private static String httpGetString(String url, Map<String, String> cookies) throws IOException {
+        HttpURLConnection conn = openConn(url, "https://www.tiktok.com/", cookies);
+        int code = conn.getResponseCode();
+        LOG.info("HTTP {} <- {}", code, url);
+        if (code < 200 || code >= 300) throw new IOException("HTTP " + code);
+        try (InputStream in = conn.getInputStream()) {
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } finally {
+            conn.disconnect();
+        }
+    }
 
-        JsonObject root = JsonParser.parseString(resp.body()).getAsJsonObject();
+    private static HttpURLConnection openConn(String url, String referer, Map<String, String> cookies) throws IOException {
+        String current = url;
+        for (int hop = 0; hop < 5; hop++) {
+            HttpURLConnection conn = (HttpURLConnection) URI.create(current).toURL().openConnection();
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(20_000);
+            conn.setRequestProperty("User-Agent", UA);
+            conn.setRequestProperty("Accept", "*/*");
+            if (referer != null) conn.setRequestProperty("Referer", referer);
+            if (cookies != null && !cookies.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                cookies.forEach((k, v) -> sb.append(k).append('=').append(v).append("; "));
+                conn.setRequestProperty("Cookie", sb.toString());
+            }
+            int code = conn.getResponseCode();
+            if (cookies != null) {
+                List<String> setCookies = conn.getHeaderFields().get("Set-Cookie");
+                if (setCookies != null) {
+                    for (String sc : setCookies) {
+                        int eq = sc.indexOf('='), semi = sc.indexOf(';');
+                        if (eq > 0) cookies.put(sc.substring(0, eq).trim(),
+                                semi > eq ? sc.substring(eq + 1, semi).trim() : sc.substring(eq + 1).trim());
+                    }
+                }
+            }
+            if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                String loc = conn.getHeaderField("Location");
+                conn.disconnect();
+                if (loc == null || loc.isEmpty()) throw new IOException("Empty redirect");
+                current = URI.create(current).resolve(loc).toString();
+                continue;
+            }
+            return conn;
+        }
+        throw new IOException("Too many redirects");
+    }
+
+    private static List<TikTokVideo> requestAndParse(String apiUrl, boolean isUrl) throws Exception {
+        String body = httpGetString(apiUrl, null);
+        JsonObject root = JsonParser.parseString(body).getAsJsonObject();
         int code = root.has("code") ? root.get("code").getAsInt() : -1;
         if (code != 0) throw new RuntimeException("API: " + str(root, "msg"));
 
@@ -108,6 +182,31 @@ public final class TikTokFeedService {
         }
         LOG.info("Parsed {} videos", out.size());
         return out;
+    }
+
+    private static TikTokVideo fetchDirectTikTokPage(String pageUrl) {
+        try {
+            Map<String, String> cookies = new LinkedHashMap<>();
+            String html = httpGetString(pageUrl, cookies);
+            Matcher m = Pattern.compile("<script[^>]*id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\"[^>]*>(.*?)</script>", Pattern.DOTALL).matcher(html);
+            if (!m.find()) return null;
+            JsonObject root = JsonParser.parseString(m.group(1)).getAsJsonObject();
+            JsonObject scope = root.getAsJsonObject("__DEFAULT_SCOPE__");
+            JsonObject detail = scope.has("webapp.video-detail")
+                    ? scope.getAsJsonObject("webapp.video-detail")
+                    : scope.getAsJsonObject("webapp.reflow.video.detail");
+            if (detail == null) return null;
+            JsonObject item = detail.getAsJsonObject("itemInfo").getAsJsonObject("itemStruct");
+            String play = item.getAsJsonObject("video").get("playAddr").getAsString();
+            String id = str(item, "id");
+            String desc = str(item, "desc");
+            String author = "@" + str(item.getAsJsonObject("author"), "uniqueId");
+            TikTokVideo v = new TikTokVideo(id, author, desc, play, 0);
+            return v;
+        } catch (Exception e) {
+            LOG.warn("Direct TikTok fallback failed: {}", e.toString());
+            return null;
+        }
     }
 
     private static TikTokVideo parseItem(JsonObject o) {
@@ -147,20 +246,20 @@ public final class TikTokFeedService {
                 }
                 LOG.info("Downloading {} -> {}", video.id, video.playUrl);
                 Path tmp = dir.resolve(safeId + ".part");
-                HttpRequest req = HttpRequest.newBuilder(URI.create(video.playUrl))
-                        .timeout(Duration.ofSeconds(30))
-                        .header("User-Agent", UA).header("Referer", "https://www.tiktok.com/").GET().build();
-                HttpResponse<InputStream> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofInputStream());
-                if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
-                    try (InputStream in = resp.body()) { Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING); }
+                HttpURLConnection conn = openConn(video.playUrl, "https://www.tiktok.com/", null);
+                int code = conn.getResponseCode();
+                if (code >= 200 && code < 300) {
+                    try (InputStream in = conn.getInputStream()) {
+                        Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+                    } finally { conn.disconnect(); }
                     Files.move(tmp, finalFile, StandardCopyOption.REPLACE_EXISTING);
                     video.localPath = finalFile.toAbsolutePath().toString();
                     LOG.info("Ready {} ({} bytes)", safeId, Files.size(finalFile));
                     trimCache(dir);
                 } else {
-                    video.errorMsg = "HTTP " + resp.statusCode();
+                    conn.disconnect();
+                    video.errorMsg = "HTTP " + code;
                     video.failed = true;
-                    LOG.warn("Download HTTP {} for {}", resp.statusCode(), video.id);
                 }
             } catch (Exception e) {
                 video.errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
@@ -168,6 +267,37 @@ public final class TikTokFeedService {
                 LOG.error("Download error for " + video.id, e);
             } finally { video.downloading = false; }
         });
+    }
+
+    private static void saveFeedToDisk(List<TikTokVideo> list) {
+        try {
+            Path f = FabricLoader.getInstance().getGameDir().resolve("tiktok_cache").resolve("last_feed.json");
+            Files.createDirectories(f.getParent());
+            JsonArray arr = new JsonArray();
+            for (TikTokVideo v : list) {
+                JsonObject o = new JsonObject();
+                o.addProperty("id", v.id); o.addProperty("author", v.author);
+                o.addProperty("title", v.title); o.addProperty("playUrl", v.playUrl);
+                o.addProperty("likes", v.likes);
+                arr.add(o);
+            }
+            Files.writeString(f, arr.toString(), StandardCharsets.UTF_8);
+        } catch (Exception ignored) {}
+    }
+
+    private static List<TikTokVideo> loadFeedFromDisk() {
+        List<TikTokVideo> out = new ArrayList<>();
+        try {
+            Path f = FabricLoader.getInstance().getGameDir().resolve("tiktok_cache").resolve("last_feed.json");
+            if (!Files.exists(f)) return out;
+            JsonArray arr = JsonParser.parseString(Files.readString(f, StandardCharsets.UTF_8)).getAsJsonArray();
+            for (JsonElement el : arr) {
+                JsonObject o = el.getAsJsonObject();
+                out.add(new TikTokVideo(str(o, "id"), str(o, "author"), str(o, "title"), str(o, "playUrl"),
+                        o.has("likes") ? o.get("likes").getAsLong() : 0));
+            }
+        } catch (Exception ignored) {}
+        return out;
     }
 
     private static void trimCache(Path dir) {
