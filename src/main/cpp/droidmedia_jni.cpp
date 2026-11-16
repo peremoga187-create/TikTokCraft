@@ -92,7 +92,7 @@ static bool openTrack(const char* path, const char* mimePrefix, TrackDecoder& td
             if (strncmp(mime, mimePrefix, strlen(mimePrefix)) == 0) {
                 td.trackIndex = static_cast<int>(i);
                 AMediaExtractor_selectTrack(td.extractor, i);
-                if (isVideo) AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, COLOR_FMT_YUV420_FLEXIBLE);
+                // keep default color format
                 td.codec = AMediaCodec_createDecoderByType(mime);
                 if (!td.codec || AMediaCodec_configure(td.codec, fmt, nullptr, nullptr, 0) != AMEDIA_OK) {
                     AMediaFormat_delete(fmt); return false;

@@ -2,6 +2,8 @@ package com.ttcraft.tiktok;
 
 import com.google.gson.*;
 import net.fabricmc.loader.api.FabricLoader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -14,6 +16,7 @@ import java.util.concurrent.*;
 import java.util.function.Consumer;
 
 public final class TikTokFeedService {
+    private static final Logger LOG = LoggerFactory.getLogger("TikTokCraft");
     private static final String UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36";
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
@@ -24,121 +27,93 @@ public final class TikTokFeedService {
         return t;
     });
 
-    private static Path topicsFile() {
-        return FabricLoader.getInstance().getConfigDir().resolve("tiktokcraft_topics.txt");
-    }
-
-    public static String loadSavedTopics() {
-        try {
-            Path p = topicsFile();
-            if (Files.exists(p)) return Files.readString(p, StandardCharsets.UTF_8).trim();
-        } catch (Exception ignored) {}
-        return "";
-    }
-
-    public static void saveTopics(String rawTopics) {
-        try {
-            Files.createDirectories(FabricLoader.getInstance().getConfigDir());
-            Files.writeString(topicsFile(), rawTopics == null ? "" : rawTopics.trim(), StandardCharsets.UTF_8);
-        } catch (Exception ignored) {}
-    }
-
     public static void fetchFeedAsync(String query, Consumer<List<TikTokVideo>> onOk, Consumer<String> onErr) {
         POOL.submit(() -> {
             try {
                 List<TikTokVideo> list = fetchFeed(query);
-                if (list.isEmpty()) onErr.accept("Видео не найдены");
+                if (list.isEmpty()) onErr.accept("Пустой ответ от TikTok API");
                 else onOk.accept(list);
             } catch (Exception e) {
-                onErr.accept("Ошибка сети: " + e.getMessage());
+                LOG.error("Feed fetch error", e);
+                onErr.accept(e.getClass().getSimpleName() + ": " + e.getMessage());
             }
         });
     }
 
     private static List<TikTokVideo> fetchFeed(String query) throws Exception {
         String q = query == null ? "" : query.trim();
-        if (!q.isEmpty()) return fetchSingleQuery(q);
+        boolean isUrl = q.startsWith("http://") || q.startsWith("https://");
+        boolean isUser = !isUrl && q.startsWith("@") && q.length() > 1;
+        boolean isSearch = !isUrl && !isUser && !q.isEmpty();
 
-        // Если поле пустое — грузим по сохранённым темам пользователя ("Моя лента")
-        String saved = loadSavedTopics();
-        if (!saved.isEmpty()) {
-            String[] parts = saved.split(",");
-            List<String> valid = new ArrayList<>();
-            for (String s : parts) {
-                String t = s.trim();
-                if (!t.isEmpty()) valid.add(t);
-            }
-            if (!valid.isEmpty()) {
-                Collections.shuffle(valid);
-                List<TikTokVideo> combined = new ArrayList<>();
-                int maxTopics = Math.min(2, valid.size());
-                for (int i = 0; i < maxTopics; i++) {
-                    if (i > 0) Thread.sleep(1100); // защита от лимита 1 req/sec
-                    combined.addAll(fetchSingleQuery(valid.get(i)));
-                }
-                Collections.shuffle(combined);
-                if (!combined.isEmpty()) return combined;
-            }
-        }
+        String apiUrl = isUrl
+                ? "https://www.tikwm.com/api/?url=" + enc(q)
+                : isUser
+                ? "https://www.tikwm.com/api/user/posts?unique_id=" + enc(q) + "&count=15&cursor=0"
+                : isSearch
+                ? "https://www.tikwm.com/api/feed/search?keywords=" + enc(q) + "&count=15&cursor=0"
+                : "https://www.tikwm.com/api/feed/list?region=UA&count=15";
 
-        // Иначе общие рекомендации UA -> US
-        List<TikTokVideo> out = requestAndParse("https://www.tikwm.com/api/feed/list?region=UA&count=15", false, false);
-        if (out.isEmpty()) {
-            Thread.sleep(1100);
-            out = requestAndParse("https://www.tikwm.com/api/feed/list?region=US&count=15", false, false);
+        List<TikTokVideo> out = requestAndParse(apiUrl, isUrl);
+        if (out.isEmpty() && !isUrl && !isUser && !isSearch) {
+            Thread.sleep(1150);
+            out = requestAndParse("https://www.tikwm.com/api/feed/list?region=US&count=15", false);
         }
         return out;
     }
 
-    private static List<TikTokVideo> fetchSingleQuery(String q) throws Exception {
-        boolean isUrl = q.startsWith("http://") || q.startsWith("https://");
-        boolean isUser = !isUrl && q.startsWith("@") && q.length() > 1;
-        String apiUrl;
-        if (isUrl) {
-            apiUrl = "https://www.tikwm.com/api/?url=" + enc(q);
-        } else if (isUser) {
-            apiUrl = "https://www.tikwm.com/api/user/posts?unique_id=" + enc(q) + "&count=15&cursor=0";
-        } else {
-            apiUrl = "https://www.tikwm.com/api/feed/search?keywords=" + enc(q) + "&count=15&cursor=0";
-        }
-        return requestAndParse(apiUrl, isUrl, !isUrl);
-    }
+    private static String enc(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8); }
 
-    private static String enc(String s) {
-        return URLEncoder.encode(s, StandardCharsets.UTF_8);
-    }
-
-    private static List<TikTokVideo> requestAndParse(String apiUrl, boolean isUrl, boolean hasVideosField) throws Exception {
+    private static List<TikTokVideo> requestAndParse(String apiUrl, boolean isUrl) throws Exception {
+        LOG.info("Requesting TikTok API: {}", apiUrl);
         HttpRequest req = HttpRequest.newBuilder(URI.create(apiUrl))
                 .timeout(Duration.ofSeconds(15))
                 .header("User-Agent", UA).header("Accept", "application/json").GET().build();
         HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+        LOG.info("API HTTP {} (len={})", resp.statusCode(), resp.body().length());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new RuntimeException("HTTP " + resp.statusCode());
+        }
+
         JsonObject root = JsonParser.parseString(resp.body()).getAsJsonObject();
+        int code = root.has("code") ? root.get("code").getAsInt() : -1;
+        if (code != 0) {
+            String msg = str(root, "msg");
+            LOG.warn("API code={}, msg={}", code, msg);
+            throw new RuntimeException("API: " + msg);
+        }
+
         List<TikTokVideo> out = new ArrayList<>();
         if (!root.has("data") || root.get("data").isJsonNull()) return out;
+        JsonElement data = root.get("data");
 
-        if (isUrl) {
-            TikTokVideo v = parseItem(root.getAsJsonObject("data"));
+        if (isUrl && data.isJsonObject()) {
+            TikTokVideo v = parseItem(data.getAsJsonObject());
             if (v != null) out.add(v);
             return out;
         }
-        JsonArray arr = hasVideosField
-                ? root.getAsJsonObject("data").getAsJsonArray("videos")
-                : root.getAsJsonArray("data");
+
+        JsonArray arr = data.isJsonArray() ? data.getAsJsonArray()
+                : (data.isJsonObject() && data.getAsJsonObject().has("videos") && data.getAsJsonObject().get("videos").isJsonArray())
+                ? data.getAsJsonObject().getAsJsonArray("videos") : null;
         if (arr == null) return out;
+
         for (JsonElement el : arr) {
             if (el.isJsonObject()) {
                 TikTokVideo v = parseItem(el.getAsJsonObject());
                 if (v != null) out.add(v);
             }
         }
+        LOG.info("Parsed {} videos", out.size());
         return out;
     }
 
     private static TikTokVideo parseItem(JsonObject o) {
         String play = str(o, "play");
         if (play.isEmpty()) return null;
-        if (!play.startsWith("http")) play = "https://www.tikwm.com" + play;
+        if (play.startsWith("//")) play = "https:" + play;
+        else if (play.startsWith("/")) play = "https://www.tikwm.com" + play;
+
         String id = str(o, "video_id");
         if (id.isEmpty()) id = str(o, "id");
         if (id.isEmpty()) id = String.valueOf(Math.abs(play.hashCode()));
@@ -169,6 +144,7 @@ public final class TikTokFeedService {
                     video.localPath = finalFile.toAbsolutePath().toString();
                     return;
                 }
+                LOG.info("Downloading video {} from {}", video.id, video.playUrl);
                 Path tmp = dir.resolve(safeId + ".part");
                 HttpRequest req = HttpRequest.newBuilder(URI.create(video.playUrl))
                         .timeout(Duration.ofSeconds(30))
@@ -178,10 +154,18 @@ public final class TikTokFeedService {
                     try (InputStream in = resp.body()) { Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING); }
                     Files.move(tmp, finalFile, StandardCopyOption.REPLACE_EXISTING);
                     video.localPath = finalFile.toAbsolutePath().toString();
+                    LOG.info("Downloaded {} ({} bytes)", safeId, Files.size(finalFile));
                     trimCache(dir);
-                } else { video.failed = true; }
-            } catch (Exception e) { video.failed = true; }
-            finally { video.downloading = false; }
+                } else {
+                    video.errorMsg = "HTTP " + resp.statusCode();
+                    video.failed = true;
+                    LOG.warn("Download failed {} -> HTTP {}", video.id, resp.statusCode());
+                }
+            } catch (Exception e) {
+                video.errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
+                video.failed = true;
+                LOG.error("Download exception for " + video.id, e);
+            } finally { video.downloading = false; }
         });
     }
 
