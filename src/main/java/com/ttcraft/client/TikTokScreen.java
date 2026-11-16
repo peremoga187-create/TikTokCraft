@@ -26,7 +26,7 @@ public class TikTokScreen extends Screen {
     private static final Logger LOG = LoggerFactory.getLogger("TikTokCraft");
     private final Screen parent;
     private List<TikTokVideo> feed = new ArrayList<>();
-    private int currentIndex = 0;
+    private int currentIndex = 0, consecutiveSkips = 0;
     private TextFieldWidget searchBox;
     private ButtonWidget pauseBtn;
 
@@ -78,6 +78,7 @@ public class TikTokScreen extends Screen {
 
         if (feed.isEmpty()) {
             List<TikTokVideo> cached = TikTokFeedService.getCachedFeed();
+            if (cached.isEmpty()) cached = TikTokFeedService.loadFeedFromDisk();
             if (!cached.isEmpty()) {
                 this.feed = new ArrayList<>(cached);
                 prepareAroundCurrent();
@@ -91,6 +92,7 @@ public class TikTokScreen extends Screen {
         closePlayer();
         feed = new ArrayList<>();
         currentIndex = 0;
+        consecutiveSkips = 0;
         statusText = query.trim().isEmpty() ? "Загрузка рекомендаций..." : "Загрузка: " + query + "...";
 
         TikTokFeedService.fetchFeedAsync(query, list -> {
@@ -99,6 +101,7 @@ public class TikTokScreen extends Screen {
                 if (screenClosed) return;
                 this.feed = list;
                 this.currentIndex = 0;
+                this.consecutiveSkips = 0;
                 prepareAroundCurrent();
             });
         }, err -> {
@@ -150,7 +153,8 @@ public class TikTokScreen extends Screen {
         if (pauseBtn != null) pauseBtn.setMessage(Text.literal("⏸"));
     }
 
-    private void tryOpenVideo(String path) {
+    private void tryOpenVideo(TikTokVideo cur) {
+        String path = cur.localPath;
         closePlayer();
         openedPath = path;
         try {
@@ -161,16 +165,21 @@ public class TikTokScreen extends Screen {
                 int h = DroidMediaNative.nativeGetHeight(playerHandle);
                 LOG.info("Opened video {}x{} from {}", w, h, path);
                 if (w > 0 && h > 0) {
+                    consecutiveSkips = 0;
                     frameBuffer = MemoryUtil.memAlloc(w * h * 4).order(ByteOrder.nativeOrder());
                     pcmBuffer = MemoryUtil.memAlloc(65536).order(ByteOrder.nativeOrder());
                     videoTexture = new MinecraftVideoTexture();
                     audioOut = new OpenAlAudioOutput(DroidMediaNative.nativeGetAudioSampleRate(playerHandle), DroidMediaNative.nativeGetAudioChannels(playerHandle));
                     startTimeMs = System.currentTimeMillis(); lastFramePtsMs = -1; paused = false;
-                } else { closePlayer(); statusText = "Ошибка размера: " + w + "x" + h; }
-            } else {
-                LOG.error("nativeCreate returned 0 for {}", path);
-                statusText = "MediaCodec не открыл mp4";
+                    return;
+                }
             }
+            LOG.warn("Skipping broken video: {}", path);
+            try { Files.deleteIfExists(Path.of(path)); } catch (Exception ignored) {}
+            cur.localPath = null; cur.failed = true; cur.errorMsg = "Неподдерживаемый кодек";
+            closePlayer();
+            if (++consecutiveSkips < feed.size()) switchVideo(1);
+            else statusText = "Нет рабочих видео в ленте";
         } catch (Throwable t) {
             LOG.error("Failed opening video " + path, t);
             closePlayer();
@@ -181,7 +190,7 @@ public class TikTokScreen extends Screen {
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
         super.render(context, mouseX, mouseY, delta);
-        context.drawTextWithShadow(this.textRenderer, Text.literal("v1.1"), 8, this.height - 14, 0x88FFFFFF);
+        context.drawTextWithShadow(this.textRenderer, Text.literal("v1.2"), 8, this.height - 14, 0x88FFFFFF);
 
         int phoneH = (int) (this.height * 0.78), phoneW = (int) (phoneH * 9.0 / 16.0);
         int x = (this.width - phoneW) / 2, y = 34 + (this.height - 38 - phoneH) / 2;
@@ -189,8 +198,11 @@ public class TikTokScreen extends Screen {
 
         TikTokVideo cur = feed.isEmpty() ? null : feed.get(currentIndex);
         if (cur != null) {
-            if (cur.localPath != null && !cur.localPath.equals(openedPath) && playerHandle == 0) tryOpenVideo(cur.localPath);
-            else if (cur.failed && playerHandle == 0) statusText = "Скачивание: " + (cur.errorMsg != null ? cur.errorMsg : "ошибка");
+            if (cur.localPath != null && !cur.localPath.equals(openedPath) && playerHandle == 0) tryOpenVideo(cur);
+            else if (cur.failed && playerHandle == 0) {
+                if (++consecutiveSkips < feed.size()) switchVideo(1);
+                else statusText = "Скачивание: " + (cur.errorMsg != null ? cur.errorMsg : "ошибка");
+            }
             else if (cur.downloading && playerHandle == 0) statusText = "Скачивание видео...";
         }
 
