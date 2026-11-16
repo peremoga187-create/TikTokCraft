@@ -19,9 +19,7 @@ public final class NativeLoader {
         try (InputStream in = NativeLoader.class.getResourceAsStream(resPath)) {
             if (in == null) throw new IllegalStateException("Нет нативки в JAR: " + resPath);
             libBytes = in.readAllBytes();
-        } catch (Exception e) {
-            throw new RuntimeException("Ошибка чтения " + resPath, e);
-        }
+        } catch (Exception e) { throw new RuntimeException("Ошибка чтения " + resPath, e); }
 
         List<Path> dirs = new ArrayList<>();
         String tmpEnv = System.getenv("TMPDIR");

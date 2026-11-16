@@ -21,18 +21,24 @@ public final class TikTokFeedService {
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
             .connectTimeout(Duration.ofSeconds(10)).build();
-    private static final ExecutorService POOL = Executors.newFixedThreadPool(2, r -> {
+    private static final ExecutorService POOL = Executors.newFixedThreadPool(3, r -> {
         Thread t = new Thread(r, "TikTokCraft-Net");
         t.setDaemon(true);
         return t;
     });
+
+    private static volatile List<TikTokVideo> cachedFeed = List.of();
+    public static List<TikTokVideo> getCachedFeed() { return cachedFeed; }
 
     public static void fetchFeedAsync(String query, Consumer<List<TikTokVideo>> onOk, Consumer<String> onErr) {
         POOL.submit(() -> {
             try {
                 List<TikTokVideo> list = fetchFeed(query);
                 if (list.isEmpty()) onErr.accept("Пустой ответ от TikTok API");
-                else onOk.accept(list);
+                else {
+                    cachedFeed = list;
+                    onOk.accept(list);
+                }
             } catch (Exception e) {
                 LOG.error("Feed fetch error", e);
                 onErr.accept(e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -54,12 +60,16 @@ public final class TikTokFeedService {
                 ? "https://www.tikwm.com/api/feed/search?keywords=" + enc(q) + "&count=15&cursor=0"
                 : "https://www.tikwm.com/api/feed/list?region=UA&count=15";
 
-        List<TikTokVideo> out = requestAndParse(apiUrl, isUrl);
-        if (out.isEmpty() && !isUrl && !isUser && !isSearch) {
-            Thread.sleep(1150);
-            out = requestAndParse("https://www.tikwm.com/api/feed/list?region=US&count=15", false);
+        try {
+            List<TikTokVideo> out = requestAndParse(apiUrl, isUrl);
+            if (!out.isEmpty()) return out;
+        } catch (Exception firstErr) {
+            LOG.warn("First attempt failed ({}), retrying after 1.3s...", firstErr.getMessage());
         }
-        return out;
+        Thread.sleep(1300);
+        String fallbackUrl = (!isUrl && !isUser && !isSearch)
+                ? "https://www.tikwm.com/api/feed/list?region=US&count=15" : apiUrl;
+        return requestAndParse(fallbackUrl, isUrl);
     }
 
     private static String enc(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8); }
@@ -71,17 +81,11 @@ public final class TikTokFeedService {
                 .header("User-Agent", UA).header("Accept", "application/json").GET().build();
         HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
         LOG.info("API HTTP {} (len={})", resp.statusCode(), resp.body().length());
-        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
-            throw new RuntimeException("HTTP " + resp.statusCode());
-        }
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) throw new RuntimeException("HTTP " + resp.statusCode());
 
         JsonObject root = JsonParser.parseString(resp.body()).getAsJsonObject();
         int code = root.has("code") ? root.get("code").getAsInt() : -1;
-        if (code != 0) {
-            String msg = str(root, "msg");
-            LOG.warn("API code={}, msg={}", code, msg);
-            throw new RuntimeException("API: " + msg);
-        }
+        if (code != 0) throw new RuntimeException("API: " + str(root, "msg"));
 
         List<TikTokVideo> out = new ArrayList<>();
         if (!root.has("data") || root.get("data").isJsonNull()) return out;
@@ -92,12 +96,10 @@ public final class TikTokFeedService {
             if (v != null) out.add(v);
             return out;
         }
-
         JsonArray arr = data.isJsonArray() ? data.getAsJsonArray()
                 : (data.isJsonObject() && data.getAsJsonObject().has("videos") && data.getAsJsonObject().get("videos").isJsonArray())
                 ? data.getAsJsonObject().getAsJsonArray("videos") : null;
         if (arr == null) return out;
-
         for (JsonElement el : arr) {
             if (el.isJsonObject()) {
                 TikTokVideo v = parseItem(el.getAsJsonObject());
@@ -113,7 +115,6 @@ public final class TikTokFeedService {
         if (play.isEmpty()) return null;
         if (play.startsWith("//")) play = "https:" + play;
         else if (play.startsWith("/")) play = "https://www.tikwm.com" + play;
-
         String id = str(o, "video_id");
         if (id.isEmpty()) id = str(o, "id");
         if (id.isEmpty()) id = String.valueOf(Math.abs(play.hashCode()));
@@ -144,7 +145,7 @@ public final class TikTokFeedService {
                     video.localPath = finalFile.toAbsolutePath().toString();
                     return;
                 }
-                LOG.info("Downloading video {} from {}", video.id, video.playUrl);
+                LOG.info("Downloading {} -> {}", video.id, video.playUrl);
                 Path tmp = dir.resolve(safeId + ".part");
                 HttpRequest req = HttpRequest.newBuilder(URI.create(video.playUrl))
                         .timeout(Duration.ofSeconds(30))
@@ -154,17 +155,17 @@ public final class TikTokFeedService {
                     try (InputStream in = resp.body()) { Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING); }
                     Files.move(tmp, finalFile, StandardCopyOption.REPLACE_EXISTING);
                     video.localPath = finalFile.toAbsolutePath().toString();
-                    LOG.info("Downloaded {} ({} bytes)", safeId, Files.size(finalFile));
+                    LOG.info("Ready {} ({} bytes)", safeId, Files.size(finalFile));
                     trimCache(dir);
                 } else {
                     video.errorMsg = "HTTP " + resp.statusCode();
                     video.failed = true;
-                    LOG.warn("Download failed {} -> HTTP {}", video.id, resp.statusCode());
+                    LOG.warn("Download HTTP {} for {}", resp.statusCode(), video.id);
                 }
             } catch (Exception e) {
                 video.errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
                 video.failed = true;
-                LOG.error("Download exception for " + video.id, e);
+                LOG.error("Download error for " + video.id, e);
             } finally { video.downloading = false; }
         });
     }

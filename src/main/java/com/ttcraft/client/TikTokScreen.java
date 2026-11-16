@@ -38,7 +38,7 @@ public class TikTokScreen extends Screen {
 
     private long startTimeMs = -1, lastFramePtsMs = -1, pausedAtMs = -1;
     private boolean paused = false, screenClosed = false;
-    private String statusText = "Загрузка ленты TikTok...";
+    private String statusText = "Загрузка ленты...";
 
     public TikTokScreen(Screen parent) {
         super(Text.literal("TikTokCraft"));
@@ -76,7 +76,15 @@ public class TikTokScreen extends Screen {
         addDrawableChild(ButtonWidget.builder(Text.literal("▼"), b -> switchVideo(1)).dimensions(ctrlX, midY + 2, 44, 20).build());
         addDrawableChild(ButtonWidget.builder(Text.literal("↻"), b -> restartVideo()).dimensions(ctrlX, midY + 26, 44, 20).build());
 
-        if (feed.isEmpty()) loadFeed("");
+        if (feed.isEmpty()) {
+            List<TikTokVideo> cached = TikTokFeedService.getCachedFeed();
+            if (!cached.isEmpty()) {
+                this.feed = new ArrayList<>(cached);
+                prepareAroundCurrent();
+            } else {
+                loadFeed("");
+            }
+        }
     }
 
     private void loadFeed(String query) {
@@ -109,8 +117,9 @@ public class TikTokScreen extends Screen {
 
     private void prepareAroundCurrent() {
         if (feed.isEmpty()) return;
-        TikTokFeedService.ensureDownloadedAsync(feed.get(currentIndex));
-        if (currentIndex + 1 < feed.size()) TikTokFeedService.ensureDownloadedAsync(feed.get(currentIndex + 1));
+        for (int i = 0; i <= 2 && currentIndex + i < feed.size(); i++) {
+            TikTokFeedService.ensureDownloadedAsync(feed.get(currentIndex + i));
+        }
     }
 
     private void switchVideo(int delta) {
@@ -172,6 +181,8 @@ public class TikTokScreen extends Screen {
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
         super.render(context, mouseX, mouseY, delta);
+        context.drawTextWithShadow(this.textRenderer, Text.literal("v1.1"), 8, this.height - 14, 0x88FFFFFF);
+
         int phoneH = (int) (this.height * 0.78), phoneW = (int) (phoneH * 9.0 / 16.0);
         int x = (this.width - phoneW) / 2, y = 34 + (this.height - 38 - phoneH) / 2;
         context.fill(x - 3, y - 3, x + phoneW + 3, y + phoneH + 3, 0xFF141414);
